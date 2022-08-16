@@ -53,17 +53,17 @@ SECTIONS {
     .text : {
 
         /* 
-         * PROVIDE allows me to access a symbol called _text_start so
+         * PROVIDE allows me to access a symbol called _ld_text_start so
          * I know where the text section starts in the operating system.
          * This should not move, but it is here for convenience.
-         * The period '.' tells the linker to set _text_start to the
+         * The period '.' tells the linker to set _ld_text_start to the
          * CURRENT location ('.' = current memory location). This current
          * memory location moves as we add things.
          */
-        _text_start = .;
+        _ld_text_start = .;
         *(.text.init) 
         *(.text .text.*)
-        _text_end = .;
+        _ld_text_end = .;
 
     } >ram AT>ram :text
 
@@ -72,12 +72,12 @@ SECTIONS {
      * independent positions relative to the gp (global pointer) register. The globals start
      * after the text sections and are only relevant to the rodata, data, and bss sections.
      */
-    _global_pointer = .;
+    _ld_global_pointer = .;
 
     .rodata : {
-        _rodata_start = .;
+        _ld_rodata_start = .;
         *(.rodata .rodata.*)
-        _rodata_end = .;
+        _ld_rodata_end = .;
     } >ram AT>ram :text
 
     .data : {
@@ -89,28 +89,28 @@ SECTIONS {
          */
         . = ALIGN(4096);
 
-        _data_start = .;
+        _ld_data_start = .;
         *(.sdata .sdata.*) 
         *(.data .data.*)
-        _data_end = .;
+        _ld_data_end = .;
 
     } >ram AT>ram :data
 
     .bss : {
-        _bss_start = .;
+        _ld_bss_start = .;
         *(.sbss .sbss.*) 
         *(.bss .bss.*)
-        _bss_end = .;
+        _ld_bss_end = .;
     } >ram AT>ram :bss
 
-    _memory_start = ORIGIN(ram);
-    _memory_end = ORIGIN(ram) + LENGTH(ram);
-    _memory_size = LENGTH(ram);
+    _ld_memory_start = ORIGIN(ram);
+    _ld_memory_end = ORIGIN(ram) + LENGTH(ram);
+    _ld_memory_size = LENGTH(ram);
 
-    _kstack_start = _bss_end;
-    _kstack_end = _kstack_start + 0x80000;
+    _ld_kstack_start = _ld_bss_end;
+    _ld_kstack_end = _ld_kstack_start + 0x80000;
 
-    _heap_start = _kstack_end;
-    _heap_size = _memory_end - _heap_start;
+    _ld_heap_start = _ld_kstack_end;
+    _ld_heap_size = _ld_memory_end - _ld_heap_start;
 
 }

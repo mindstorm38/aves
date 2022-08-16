@@ -1,5 +1,4 @@
-//! Paged memory allocation and virtual to 
-//! physical memory mapping configuration.
+//! Paged memory allocation.
 
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;

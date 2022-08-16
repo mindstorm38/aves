@@ -1,6 +1,6 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
-
+use core::ops::{Deref, DerefMut};
 
 
 #[repr(u32)]
@@ -19,6 +19,17 @@ pub struct Mutex<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
+impl<T> Mutex<T> {
+
+    pub const fn new(data: T) -> Self {
+        Self { 
+            state: MutexState::Released, 
+            data: UnsafeCell::new(data)
+        }
+    }
+
+}
+
 impl<T: ?Sized> Mutex<T> {
 
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
@@ -32,9 +43,61 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+            unsafe {
+                // To avoid looping too fast, we wait for interrupt,
+                // and we will send a user interrupt on unlock.
+                asm!("wfi");
+            }
+        }
+    }
+
+    /// To use inside interrupt context.
+    pub fn spin_lock(&self) -> MutexGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+        }
+    }
+
+    /// Internal function used by guard to unlock the lock.
+    fn unlock(&self) {
+        unsafe {
+			asm!(
+                "amoswap.w.rl zero, zero, ({0})",
+                // TODO: Trigger software interrupt
+                in(reg) &self.state
+            );
+		}
+    }
+
 }
 
 
 pub struct MutexGuard<'a, T: ?Sized> {
     mutex: &'a Mutex<T>,
+}
+
+impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.mutex.data.get() } 
+    }
+}
+
+impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.mutex.data.get() } 
+    }
+}
+
+impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
+    fn drop(&mut self) {
+        self.mutex.unlock();
+    }
 }
