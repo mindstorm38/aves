@@ -32,8 +32,10 @@ pub mod driver;
 
 pub mod conf;
 
+pub mod util;
+
 // Internal for now, used to prototype the API.
-mod api;
+// mod api;
 
 
 

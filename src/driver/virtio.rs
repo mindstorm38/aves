@@ -5,14 +5,14 @@
 //! [`official specification`]: https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.pdf
 
 use core::ptr::{NonNull, addr_of};
-use core::num::NonZeroUsize;
 use core::cell::{RefCell, Cell};
+use core::num::NonZeroUsize;
 use core::mem::size_of;
 
 use bitflags::bitflags;
 
-use crate::{println, print, write_slice, mmio_struct};
 use crate::memory::page::{PAGE_SIZE, alloc_zeroed, alloc};
+use crate::{println, print, write_slice, mmio_struct};
 use super::{Driver, BlockDriver};
 use super::block::BlockDevice;
 
@@ -22,6 +22,8 @@ const VIRTIO_MAGIC: u32 = 0x74_72_69_76;
 
 /// Default queue len used for devices (see [`Queue`]).
 const VIRTIO_QUEUE_LEN: u32 = 1 << 7;
+
+const VIRTIO_BLOCK_SECTOR_LEN: u64 = 512;
 
 
 /// Use this driver to provide virtio discovery capabilities.
@@ -454,7 +456,7 @@ impl BlockDeviceData {
 
         unsafe {
 
-            let queue = self.queue.as_mut();
+            let queue = &mut *self.queue.as_ptr();
             queue.descriptor[idx as usize] = descriptor;
 
             let queue = &mut queue.descriptor[idx as usize];
@@ -542,7 +544,7 @@ fn load_block_device(block_driver: &BlockDriver, dev: &Device) {
     mmio.set_status(status.bits());
 
     // Note that capacity is expressed in number of 512-bytes sectors.
-    println!("   Capacity of {} bytes", config.capacity() * 512);
+    println!("   Capacity of {} bytes", config.capacity() * VIRTIO_BLOCK_SECTOR_LEN);
     
     let dev_data = BlockDeviceData {
         dev: mmio,
@@ -559,7 +561,7 @@ fn load_block_device(block_driver: &BlockDriver, dev: &Device) {
     }
 
     let mut block_dev = BlockDevice::new(dev_data, do_read, (!read_only).then_some(do_write));
-    write_slice!(block_dev.raw_name_mut(), "virtio{}", dev.idx);
+    write_slice!(block_dev.raw_name_mut(), "virtio{}", dev.idx).unwrap();
     block_driver.register(block_dev);
 
 }

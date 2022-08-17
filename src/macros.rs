@@ -40,7 +40,7 @@ macro_rules! write_slice {
                 }
             }
         }
-        write!(WriteSliceCursor($slice), $($arg)+);
+        write!(WriteSliceCursor($slice), $($arg)+)
     }};
 }
 

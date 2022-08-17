@@ -1,6 +1,6 @@
 //! Core block device driver.
 
-use core::mem::{MaybeUninit, size_of, transmute};
+use core::mem::{MaybeUninit, size_of, transmute, align_of};
 use core::cell::RefCell;
 
 use super::Driver;
@@ -66,6 +66,7 @@ impl Driver for BlockDriver {
 
 /// A fixed-size structure stored by [`BlockDriver`] that provides
 /// an abstracted API for access block devices.
+#[repr(C)]
 pub struct BlockDevice {
     /// UTF-8, nul-termined name of the block device.
     name: [u8; BLOCK_DEVICE_NAME_LEN],
@@ -90,13 +91,31 @@ impl BlockDevice {
         read: fn(data: &D, dst: &mut [u8], off: u64),
         write: Option<fn(data: &D, src: &[u8], off: u64)>
     ) -> Self {
+
         debug_assert!(size_of::<D>() <= BLOCK_DEVICE_DATA_LEN, "given data is too big to be stored inline in block device (max is {} bytes)", BLOCK_DEVICE_DATA_LEN);
+        
+        // FIXME: I don't like this.
+        // FIXME: Check alignment.
+
+        // Here we create a raw data block that is large enough to
+        // hold the given data structure (ensured by the debug_asset).
+        // Then we gen a raw pointer to the given data, and copy it
+        // to the raw data block.
+        let mut final_data = [0; BLOCK_DEVICE_DATA_LEN];
+        let raw_data = &data as *const D as *const u8;
+        
+        unsafe {
+            core::ptr::copy_nonoverlapping(raw_data, final_data.as_mut_ptr(), size_of::<D>());
+            core::mem::forget(data); // don't run destructor as we "moved" the value.
+        }
+
         Self {
             name: [0; BLOCK_DEVICE_NAME_LEN],
-            data: [0; BLOCK_DEVICE_DATA_LEN],
+            data: final_data,
             read: unsafe { transmute(read) },
             write: write.map(|write| unsafe { transmute(write) })
         }
+
     }
 
     /// Before registering the block device to the drive, use this to
