@@ -1,51 +1,58 @@
 //! Core block device driver.
 
-use core::mem::{MaybeUninit, size_of, transmute, align_of};
-use core::cell::RefCell;
+use core::mem::{MaybeUninit, transmute};
 
+use crate::util::OpaqueCell;
+use crate::sync::Mutex;
 use super::Driver;
 
 
 /// Maximum number of block devices.
 /// 
 /// *This might not be the definitive form, but for now we have a fixed length.*
-const BLOCK_DEVICE_MAX_LEN: usize = 256;
+pub const BLOCK_DEVICE_COUNT: usize = 256;
 
 /// Maximum length for the block device name.
-const BLOCK_DEVICE_NAME_LEN: usize = 16;
+pub const BLOCK_DEVICE_NAME_SIZE: usize = 16;
 
 /// Allow 64 bytes of custom data for block devices.
-const BLOCK_DEVICE_DATA_LEN: usize = 64;
+pub const BLOCK_DEVICE_DATA_SIZE: usize = 64;
 
 
 /// This driver must be used by other drivers to register block devices
 /// and their callbacks in order to provide a uniformized API to 
 /// higher-level storage drivers.
 pub struct BlockDriver {
-    devices: RefCell<([MaybeUninit<BlockDevice>; BLOCK_DEVICE_MAX_LEN], usize)>,
+    /// Registered devices.
+    devices: Mutex<BlockDevices>,
 }
 
-/// The driver is sync between threads, because the devices cell is only
-/// modified on startup (single-threaded and sequential).
-unsafe impl Sync for BlockDriver {}
+/// Vector of block devices currently registered.
+struct BlockDevices {
+    devices: [MaybeUninit<BlockDevice>; BLOCK_DEVICE_COUNT],
+    len: usize,
+}
 
 impl BlockDriver {
 
     pub const fn new() -> Self {
         Self {
-            devices: RefCell::new((unsafe { MaybeUninit::uninit().assume_init() }, 0)),
+            devices: Mutex::new(BlockDevices {
+                devices: unsafe { MaybeUninit::uninit().assume_init() },
+                len: 0,
+            }),
         }
     }
 
     /// Register a new block device.
     pub fn register(&self, dev: BlockDevice) {
 
-        let mut borrow = self.devices.borrow_mut();
-        let (devices, len) = &mut *borrow;
+        let mut borrow = self.devices.spin_lock();
 
-        debug_assert_ne!(*len, BLOCK_DEVICE_MAX_LEN, "reached max number of block devices");
-        devices[*len] = MaybeUninit::new(dev);
-        *len += 1;
+        let len = borrow.len;
+        debug_assert_ne!(len, BLOCK_DEVICE_COUNT, "reached max number of block devices");
+        borrow.devices[len] = MaybeUninit::new(dev);
+        borrow.len = len + 1;
 
     }
 
@@ -66,54 +73,45 @@ impl Driver for BlockDriver {
 
 /// A fixed-size structure stored by [`BlockDriver`] that provides
 /// an abstracted API for access block devices.
-#[repr(C)]
 pub struct BlockDevice {
     /// UTF-8, nul-termined name of the block device.
-    name: [u8; BLOCK_DEVICE_NAME_LEN],
-    /// Data depending on the block device's type.
-    data: [u8; BLOCK_DEVICE_DATA_LEN],
+    name: [u8; BLOCK_DEVICE_NAME_SIZE],
+    /// The opaque cell containing the custom data.
+    data: OpaqueCell<BLOCK_DEVICE_DATA_SIZE>,
     /// Read operation on this device.
-    read: fn(data: *const u8, dst: &mut [u8], off: u64),
+    read: fn(data: *const u8, dst: &mut [u8], off: u64) -> BlockIoResult<()>,
     /// Write operation on this device, none if this 
     /// block device is read-only.
-    write: Option<fn(data: *const u8, src: &[u8], off: u64)>,
+    write: Option<fn(data: *const u8, src: &[u8], off: u64) -> BlockIoResult<()>>,
+    /// The sector size of the device.
+    sector_size: u64,
 }
 
 impl BlockDevice {
 
     /// Construct a new block device with a custom data and 
-    /// access callbacks.
+    /// access callbacks. The custom data must be synchronizable
+    /// between threads because read and writes can happen from
+    /// any thread.
     /// 
     /// *The given name should not contains nul chars and 
     /// must be ascii.*
-    pub fn new<D>(
+    pub fn new<D: Sync>(
         data: D, 
-        read: fn(data: &D, dst: &mut [u8], off: u64),
-        write: Option<fn(data: &D, src: &[u8], off: u64)>
+        read: fn(data: &D, dst: &mut [u8], off: u64) -> BlockIoResult<()>,
+        write: Option<fn(data: &D, src: &[u8], off: u64) -> BlockIoResult<()>>,
+        sector_size: u64,
     ) -> Self {
 
-        debug_assert!(size_of::<D>() <= BLOCK_DEVICE_DATA_LEN, "given data is too big to be stored inline in block device (max is {} bytes)", BLOCK_DEVICE_DATA_LEN);
-        
-        // FIXME: I don't like this.
-        // FIXME: Check alignment.
-
-        // Here we create a raw data block that is large enough to
-        // hold the given data structure (ensured by the debug_asset).
-        // Then we gen a raw pointer to the given data, and copy it
-        // to the raw data block.
-        let mut final_data = [0; BLOCK_DEVICE_DATA_LEN];
-        let raw_data = &data as *const D as *const u8;
-        
-        unsafe {
-            core::ptr::copy_nonoverlapping(raw_data, final_data.as_mut_ptr(), size_of::<D>());
-            core::mem::forget(data); // don't run destructor as we "moved" the value.
-        }
-
+        // SAFETY: Here the transmutation is safe because &D as the same
+        // layout as *const u8.
+        // https://rust-lang.github.io/unsafe-code-guidelines/layout/pointers.html
         Self {
-            name: [0; BLOCK_DEVICE_NAME_LEN],
-            data: final_data,
+            name: [0; BLOCK_DEVICE_NAME_SIZE],
+            data: OpaqueCell::new(data),
             read: unsafe { transmute(read) },
-            write: write.map(|write| unsafe { transmute(write) })
+            write: write.map(|write| unsafe { transmute(write) }),
+            sector_size
         }
 
     }
@@ -129,20 +127,38 @@ impl BlockDevice {
         unsafe { core::str::from_utf8_unchecked(&self.name[..len]) }
     }
 
+    pub fn sector_size(&self) -> u64 {
+        self.sector_size
+    }
+
     pub fn read_only(&self) -> bool {
         self.write.is_none()
     }
 
-    pub fn read(&self, dst: &mut [u8], off: u64) {
-        (self.read)(self.data.as_ptr(), dst, off);
+    pub fn read(&self, dst: &mut [u8], off: u64) -> BlockIoResult<()> {
+        (self.read)(self.data.as_ptr(), dst, off)
     }
 
-    pub fn write(&self, src: &[u8], off: u64) {
+    pub fn write(&self, src: &[u8], off: u64) -> BlockIoResult<()> {
         if let Some(write) = self.write {
-            write(self.data.as_ptr(), src, off);
+            write(self.data.as_ptr(), src, off)
         } else {
-            panic!("this block device is read-only, you should not write to it");
+            Err(BlockIoError::ReadOnly)
         }
     }
 
+}
+
+
+pub type BlockIoResult<T> = Result<T, BlockIoError>;
+
+
+#[derive(Debug)]
+pub enum BlockIoError {
+    /// The block device is read-only.
+    ReadOnly,
+    /// The given offset is not aligned to a sector of the block device.
+    UnalignedOffset,
+    /// Internal error of the backend of the block device.
+    Internal,
 }

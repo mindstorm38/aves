@@ -1,5 +1,6 @@
 //! Common macros definitions.
 
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)+) => {
@@ -10,6 +11,7 @@ macro_rules! print {
         }
     };
 }
+
 
 #[macro_export]
 macro_rules! println {
@@ -23,6 +25,7 @@ macro_rules! println {
 		$crate::print!(concat!($fmt, "\n"), $($arg)+);
 	});
 }
+
 
 /// Write a formatted string to a slice.
 #[macro_export]
@@ -44,6 +47,8 @@ macro_rules! write_slice {
     }};
 }
 
+
+/// This macro can be used to generate MMIO volatile structures.
 #[macro_export]
 macro_rules! mmio_struct {
     (
@@ -91,4 +96,18 @@ macro_rules! __mmio_struct_field {
             <$field_type>::new(unsafe { self.0.add($field_index) })
         }
     };
+}
+
+
+/// A macro used internally to count the number of tokens you give
+/// to the macro and return the count as usize.
+#[macro_export]
+macro_rules! count {
+    () => (0usize);
+    ($x0:tt $x1:tt $x2:tt $x3:tt $x4:tt $x5:tt $x6:tt $x7:tt
+     $x8:tt $x9:tt $x10:tt $x11:tt $x12:tt $x13:tt $x14:tt $x15:tt $($xs:tt)*) => (16usize + $crate::count!($($xs)*));
+    ($x0:tt $x1:tt $x2:tt $x3:tt $x4:tt $x5:tt $x6:tt $x7:tt $($xs:tt)*) => (8usize + $crate::count!($($xs)*));
+    ($x0:tt $x1:tt $x2:tt $x3:tt $($xs:tt)*) => (4usize + $crate::count!($($xs)*));
+    ($x0:tt $x1:tt $($xs:tt)*) => (2usize + $crate::count!($($xs)*));
+    ($x0:tt $($xs:tt)*) => (1usize + $crate::count!($($xs)*));
 }

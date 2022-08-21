@@ -13,17 +13,20 @@ use bitflags::bitflags;
 
 use crate::memory::page::{PAGE_SIZE, alloc_zeroed, alloc};
 use crate::{println, print, write_slice, mmio_struct};
+use crate::sync::Mutex;
+
 use super::{Driver, BlockDriver};
-use super::block::BlockDevice;
+use super::block::{BlockDevice, BlockIoResult, BlockIoError};
 
 
 /// Magic string 'virt' in little-endian.
 const VIRTIO_MAGIC: u32 = 0x74_72_69_76;
 
 /// Default queue len used for devices (see [`Queue`]).
-const VIRTIO_QUEUE_LEN: u32 = 1 << 7;
+const VIRTIO_QUEUE_SIZE: u32 = 1 << 7;
 
-const VIRTIO_BLOCK_SECTOR_LEN: u64 = 512;
+/// Sector size for virtio block devices.
+const VIRTIO_BLOCK_SECTOR_SIZE: u64 = 512;
 
 
 /// Use this driver to provide virtio discovery capabilities.
@@ -48,16 +51,20 @@ impl<const ADDR: usize, const STRIDE: usize, const COUNT: usize> VirtioDriver<AD
         }
     }
 
+    /// Enable block devices loading by this virtio driver.
+    /// Loaded block devices will be registered in the given block driver.
     pub const fn with_block(mut self, block_driver: &'static BlockDriver) -> Self {
         self.block_driver = Some(block_driver);
         self
     }
     
+    /// Iterate over connected devices.
     pub fn iter(&self) -> impl Iterator<Item = Device> + '_ {
         let devices = self.devices.borrow();
         (0..COUNT).filter_map(move |idx| devices[idx])
     }
 
+    /// Iterate over connected devices that are of the given type.
     pub fn iter_type(&self, typ: DeviceType) -> impl Iterator<Item = Device> + '_ {
         self.iter().filter(move |dev| dev.typ == typ)
     }
@@ -156,20 +163,22 @@ pub struct Device {
 /// A generic virtio queue ("virtqueue") to use with devices.
 /// Note that the given queue size must be a power-of-two 
 /// (section 2.7 of the specification).
+/// 
+/// *This virtio queue is actually a "split virtqueue".*
+/// 
 /// **Should be aligned to page boundary.**
 #[repr(C)]
-pub struct Queue<const LEN: usize = {VIRTIO_QUEUE_LEN as usize}> {
+pub struct Queue<const SIZE: usize = {VIRTIO_QUEUE_SIZE as usize}> {
     /// Descriptor table.
-    pub descriptor: [QueueDescriptor; LEN],
+    pub descriptor: [QueueDescriptor; SIZE],
     /// Available ring.
-    pub available: QueueAvailable<LEN>,
+    pub available: QueueAvailable<SIZE>,
     /// Used ring. TODO: ALIGNMENT
-    pub used: QueueUsed<LEN>,
+    pub used: QueueUsed<SIZE>,
 }
 
 /// Used in descriptor table. 
-/// **Should be aligned to 16 bytes.**
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct QueueDescriptor {
     /// Physical address.
     pub addr: u64,
@@ -181,23 +190,35 @@ pub struct QueueDescriptor {
     pub next: u16,
 }
 
-/// **Should be aligned to 2 bytes.**
-#[repr(C)]
-pub struct QueueAvailable<const LEN: usize> {
+impl QueueDescriptor {
+
+    pub const fn new(addr: u64, len: u32, write: bool) -> Self {
+        Self {
+            addr,
+            len,
+            flags: if write { QueueDescriptorFlag::WRITE.bits() } else { 0 },
+            next: 0,
+        }
+    }
+
+}
+
+#[repr(C, align(2))]
+pub struct QueueAvailable<const SIZE: usize> {
     /// Should be interpreted and written to using [`QueueAvailableFlag`].
     pub flags: u16,
     pub index: u16,
-    pub ring: [u16; LEN],
+    pub ring: [u16; SIZE],
     pub event: u16,
 }
 
-/// **Should be aligned to 4 bytes.**
-#[repr(C)]
-pub struct QueueUsed<const LEN: usize> {
+/// This structure is aligned to PAGE_SIZE (4096) because we are using the legacy interface.
+#[repr(C, align(4096))]
+pub struct QueueUsed<const SIZE: usize> {
     /// Should be interpreted and written to using [`QueueUsedFlag`].
     pub flags: u16,
     pub index: u16,
-    pub ring: [QueueUsedElement; LEN],
+    pub ring: [QueueUsedElement; SIZE],
     pub event: u16,
 }
 
@@ -438,37 +459,140 @@ mmio_struct! {
 }
 
 
-
-/// Data used for block device.
-#[derive(Debug)]
-pub struct BlockDeviceData {
-    pub dev: MmioLegacyDevice,
-    pub queue: NonNull<Queue>,
-    pub queue_idx: Cell<u16>,
+/// This structure handles a virtio queue (allocated in pages) 
+/// and tracks the index of the last item appended to the queue.
+/// 
+/// This structure is intentionnaly not thread-safe (Sync), 
+/// therefore you must use it through a mutex, do all the
+/// transactions (append descriptors and notify the queue) 
+/// and then release the lock.
+pub struct QueueHandler<const SIZE: usize = {VIRTIO_QUEUE_SIZE as usize}> {
+    /// The actual queue pointer.
+    queue: NonNull<Queue<SIZE>>,
+    /// The index of the last inserted item.
+    index: u16,
 }
 
-impl BlockDeviceData {
+impl<const SIZE: usize> QueueHandler<SIZE> {
 
-    pub fn append_descriptor(&self, descriptor: QueueDescriptor) {
+    pub const PAGES_COUNT: usize = (size_of::<Queue<SIZE>>() + PAGE_SIZE - 1) / PAGE_SIZE;
 
-        let idx = (self.queue_idx.get() as u32 + 1) % VIRTIO_QUEUE_LEN;
-        self.queue_idx.set(idx as u16);
+    pub fn new() -> Result<Self, ()> {
 
-        unsafe {
-
-            let queue = &mut *self.queue.as_ptr();
-            queue.descriptor[idx as usize] = descriptor;
-
-            let queue = &mut queue.descriptor[idx as usize];
-
-            if queue.flags & QueueDescriptorFlag::NEXT.bits() != 0 {
-                
+        // SAFETY: Allocating here is safe because drivers' loading is single
+        // threaded and sequential. And the page count cannot be 0.
+        let queue: NonNull<Queue<SIZE>> = unsafe {
+            // Note: we use zeroed allocation in order to avoid using 
+            match alloc_zeroed(NonZeroUsize::new_unchecked(Self::PAGES_COUNT)) {
+                Ok(ptr) => ptr.cast(),
+                Err(_) => return Err(()),
             }
+        };
 
+        Ok(Self {
+            queue,
+            index: 0,
+        })
+
+    }
+
+    #[inline]
+    pub fn size(&self) -> u32 {
+        SIZE as u32
+    }
+
+    #[inline]
+    pub fn page_size(&self) -> u32 {
+        PAGE_SIZE as u32
+    }
+
+    #[inline]
+    pub fn page_number(&self) -> u32 {
+        (self.queue.addr().get() / PAGE_SIZE) as u32
+    }
+
+    pub fn append<'a, 'b: 'a>(&'a mut self, descriptor: QueueDescriptor) -> QueueHandlerNext<'a, 'b, SIZE> {
+        
+        let index = ((self.index as u32 + 1) % SIZE as u32) as u16;
+        self.index = index;
+
+        // Note: the reference here has an unbound lifetime.
+        let queue = unsafe { self.queue.as_mut() };
+        queue.descriptor[index as usize] = descriptor;
+
+        let queue = &mut queue.descriptor[index as usize];
+
+        // SAFETY: Here we leak two mutable references, both for the
+        // handler and the previous descriptor. This is safe because
+        // this is not exposed and the caller can't call 'append'
+        // if this object is existing.
+        QueueHandlerNext {
+            index,
+            head_index: index,
+            handler: self, // 'a
+            prev: queue    // 'b
         }
 
     }
 
+    /// Mark the given descriptor index has available for the device.
+    pub fn mark_available(&mut self, head_index: u16) {
+        let queue = unsafe { self.queue.as_mut() };
+        let index = queue.available.index;
+        queue.available.ring[index as usize] = head_index;
+        queue.available.index = ((index as u32 + 1) % SIZE as u32) as u16;
+    }
+
+}
+
+pub struct QueueHandlerNext<'a, 'b: 'a, const SIZE: usize> {
+    /// Index of the previously inserted descriptor.
+    index: u16,
+    /// Index of the first inserted descriptor in the chain, this is constant over calls
+    /// to `next`.
+    head_index: u16,
+    /// Mutable reference to the queue handler. This mutable reference and its lifetime
+    /// prevent the caller from appending to the handler while an instance of this
+    /// structure is existing.
+    handler: &'a mut QueueHandler<SIZE>,
+    /// Mutable reference to the previous descriptor.
+    prev: &'b mut QueueDescriptor,
+}
+
+impl<'a, 'b: 'a, const SIZE: usize> QueueHandlerNext<'a, 'b, SIZE> {
+
+    pub fn next<'b_: 'a>(mut self, descriptor: QueueDescriptor) -> QueueHandlerNext<'a, 'b_, SIZE> {
+        let mut next = self.handler.append(descriptor);
+        // The head index should not change over calls to 'next'.
+        next.head_index = self.head_index;
+        self.prev.flags |= QueueDescriptorFlag::NEXT.bits();
+        self.prev.next = self.index;
+        next
+    }
+
+    /// Return the index of the previously inserted descriptor.
+    #[inline]
+    pub fn index(&self) -> u16 {
+        self.index
+    }
+
+    /// Return the index of the previously inserted descriptor.
+    #[inline]
+    pub fn head_index(&self) -> u16 {
+        self.head_index
+    }
+
+}
+
+
+///////////////////////
+//// BLOCK DEVICES ////
+///////////////////////
+
+/// Data used for block device.
+pub struct BlockDeviceData {
+    pub mmio: MmioLegacyDevice,
+    pub queue: QueueHandler,
 }
 
 
@@ -514,67 +638,65 @@ fn load_block_device(block_driver: &BlockDriver, dev: &Device) {
     // 7. Configure our device, we will only use the first queue #0.
     // First, we get the maximum size of the queue.
     mmio.set_queue_sel(0);
-    if mmio.queue_num_max() < VIRTIO_QUEUE_LEN {
+    if mmio.queue_num_max() < VIRTIO_QUEUE_SIZE {
         println!("   Queue too short");
         return;
     }
     
-    mmio.set_queue_num(VIRTIO_QUEUE_LEN);
-    mmio.set_guest_page_size(PAGE_SIZE as u32);
-
-    // Calculate the number of pages needed to store the device's queue.
-    let queue_pages_count = (size_of::<Queue>() + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    // SAFETY: Allocating here is safe because drivers' loading is single
-    // threaded and sequential. And the page count cannot be 0.
-    let queue: NonNull<Queue> = unsafe { 
-        match alloc_zeroed(NonZeroUsize::new_unchecked(queue_pages_count)) {
-            Ok(ptr) => ptr.cast(),
-            Err(_) => {
-                println!("   Failed queue page allocation");
-                return;
-            }
+    let queue = match QueueHandler::new() {
+        Ok(queue) => queue,
+        Err(()) => {
+            println!("   Failed queue allocation");
+            return;
         }
     };
 
-    mmio.set_queue_physical_page_number((queue.addr().get() / PAGE_SIZE) as u32);
+    mmio.set_queue_num(queue.size());
+    mmio.set_guest_page_size(queue.page_size());
+    mmio.set_queue_physical_page_number(queue.page_number());
 
     // 8. Our driver is operationnal!
     status |= DeviceStatus::DRIVER_OK;
     mmio.set_status(status.bits());
 
     // Note that capacity is expressed in number of 512-bytes sectors.
-    println!("   Capacity of {} bytes", config.capacity() * VIRTIO_BLOCK_SECTOR_LEN);
+    println!("   Capacity of {} bytes", config.capacity() * VIRTIO_BLOCK_SECTOR_SIZE);
     
-    let dev_data = BlockDeviceData {
-        dev: mmio,
+    // Construct our block device data for registering it to the block driver.
+    // We put the device data in a mutex because we need to access it safely
+    // accross threads.
+    let dev_data = Mutex::new(BlockDeviceData {
+        mmio,
         queue,
-        queue_idx: Cell::new(0),
-    };
+    });
 
-    fn do_read(data: &BlockDeviceData, dst: &mut [u8], off: u64) {
-        do_block_operation(data, dst.as_mut_ptr(), dst.len(), off, false);
+    fn do_read(data: &Mutex<BlockDeviceData>, dst: &mut [u8], off: u64) -> BlockIoResult<()> {
+        do_block_operation(data, dst.as_mut_ptr(), dst.len(), off, false)
     }
 
-    fn do_write(data: &BlockDeviceData, src: &[u8], off: u64) {
-        do_block_operation(data, src.as_ptr() as _, src.len(), off, true);
+    fn do_write(data: &Mutex<BlockDeviceData>, src: &[u8], off: u64) -> BlockIoResult<()> {
+        do_block_operation(data, src.as_ptr() as _, src.len(), off, true)
     }
 
-    let mut block_dev = BlockDevice::new(dev_data, do_read, (!read_only).then_some(do_write));
-    write_slice!(block_dev.raw_name_mut(), "virtio{}", dev.idx).unwrap();
+    let mut block_dev = BlockDevice::new(dev_data, do_read, (!read_only).then_some(do_write), VIRTIO_BLOCK_SECTOR_SIZE);
+    write_slice!(block_dev.raw_name_mut(), "virtio{:02}", dev.idx).unwrap();
     block_driver.register(block_dev);
 
 }
 
-fn do_block_operation(data: &BlockDeviceData, buf: *mut u8, len: usize, off: u64, write: bool) {
+
+fn do_block_operation(data: &Mutex<BlockDeviceData>, buf: *mut u8, len: usize, off: u64, write: bool) -> BlockIoResult<()> {
+
+    // Lock for the whole operation.
+    let mut data = data.spin_lock();
 
     // Sectors are 512 bytes 
-    let sector = off / 512;
+    let sector = off / VIRTIO_BLOCK_SECTOR_SIZE;
 
     // Allocate a temporary request structure that take an entire page.
     // FIXME: In the future, improve the allocation strategy.
     let mut block_request: NonNull<BlockRequest> = unsafe {
-        alloc(NonZeroUsize::new_unchecked(size_of::<BlockRequest>())).unwrap().cast()
+        alloc(NonZeroUsize::new_unchecked(size_of::<BlockRequest>())).map_err(|_| BlockIoError::Internal)?.cast()
     };
 
     // SAFETY: We own the only pointer to request, so the following mut ref
@@ -588,35 +710,17 @@ fn do_block_operation(data: &BlockDeviceData, buf: *mut u8, len: usize, off: u64
     block_request.data = buf;
     block_request.status = 111;
 
-    // Descriptor for the header.
-    let header_desc = QueueDescriptor {
-        addr: unsafe { addr_of!(block_request.header).addr() as u64 },
-        len: size_of::<BlockRequestHeader>() as u32,
-        flags: QueueDescriptorFlag::NEXT.bits(),
-        next: 0,
-    };
+    let head_index = data.queue
+        .append(QueueDescriptor::new(addr_of!(block_request.header).addr() as u64, size_of::<BlockRequestHeader>() as u32, false))
+        .next(QueueDescriptor::new(buf.addr() as u64, len as u32, !write)) // TODO: Check !write
+        .next(QueueDescriptor::new(addr_of!(block_request.status).addr() as u64, 1, true))
+        .head_index();
 
-    // Descriptor for the buffer.
-    let mut data_desc = QueueDescriptor {
-        addr: buf.addr() as u64,
-        len: len as u32,
-        flags: QueueDescriptorFlag::NEXT.bits(),
-        next: 0,
-    };
-
-    if !write {
-        data_desc.flags |= QueueDescriptorFlag::WRITE.bits();
-    }
-
-    let status_desc = QueueDescriptor {
-        addr: addr_of!(block_request.status).addr() as u64,
-        len: 1,
-        flags: QueueDescriptorFlag::WRITE.bits(),
-        next: 0,
-    };
-
-    // TODO: Add descriptors to the queue.
+    data.queue.mark_available(head_index);
+    
     // Notify the queue 0 as it is the only one used.
-    data.dev.set_queue_notify(0);
+    data.mmio.set_queue_notify(0);
+
+    Ok(())
 
 }

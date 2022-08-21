@@ -24,7 +24,7 @@ pub mod filesystem;
 pub mod uart;
 pub mod trap;
 
-pub mod lock;
+pub mod sync;
 
 pub mod macros;
 
@@ -66,13 +66,9 @@ extern "C" fn kmain() {
     }
     println!("== PLIC Initialized");
 
-    unsafe { conf::register_drivers(); }
-    
-    for driver in driver::iter() {
+    for driver in conf::DRIVERS {
         driver.load();
     }
-
-
 
     unsafe { trap::init_hart_zero(); }
     println!("== Interrupt trap initialized");

@@ -6,13 +6,15 @@
 /// A macro to easily register drivers.
 macro_rules! drivers {
     ($($name:ident: $typ:ty = $constructor:expr;)*) => {
-        pub unsafe fn register_drivers() {
-            use crate::driver::*;
-            $(
-                static $name: $typ = $constructor;
-                crate::driver::register(&$name);
-            )*
-        }
+
+        use crate::driver::*;
+
+        $(static $name: $typ = $constructor;)*
+
+        pub static DRIVERS: [&'static dyn Driver; $crate::count!($($name)*)] = [
+            $(&$name),*
+        ];
+
     };
 }
 

@@ -1,3 +1,5 @@
+//! Synchronization primitives for the kernel-side.
+
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -18,6 +20,8 @@ pub struct Mutex<T: ?Sized> {
     state: MutexState,
     data: UnsafeCell<T>,
 }
+
+unsafe impl<T: ?Sized> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
 
@@ -43,18 +47,18 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
-    pub fn lock(&self) -> MutexGuard<'_, T> {
-        loop {
-            if let Some(guard) = self.try_lock() {
-                return guard;
-            }
-            unsafe {
-                // To avoid looping too fast, we wait for interrupt,
-                // and we will send a user interrupt on unlock.
-                asm!("wfi");
-            }
-        }
-    }
+    // pub fn lock(&self) -> MutexGuard<'_, T> {
+    //     loop {
+    //         if let Some(guard) = self.try_lock() {
+    //             return guard;
+    //         }
+    //         unsafe {
+    //             // To avoid looping too fast, we wait for interrupt,
+    //             // and we will send a user interrupt on unlock.
+    //             asm!("wfi");
+    //         }
+    //     }
+    // }
 
     /// To use inside interrupt context.
     pub fn spin_lock(&self) -> MutexGuard<'_, T> {
@@ -70,7 +74,7 @@ impl<T: ?Sized> Mutex<T> {
         unsafe {
 			asm!(
                 "amoswap.w.rl zero, zero, ({0})",
-                // TODO: Trigger software interrupt
+                // TODO : Trigger software interrupt
                 in(reg) &self.state
             );
 		}
